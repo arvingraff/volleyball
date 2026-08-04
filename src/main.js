@@ -31,8 +31,9 @@ const initialState = {
   ],
   teams: [],
   matches: [],
-  semifinals: [],
+  extraRounds: [],
   final: null,
+  bronzeFinal: null,
 };
 
 const STORAGE_KEY = 'volleyflow-planner-state';
@@ -65,6 +66,105 @@ function skillRating(skill) {
 function skillLabel(skill) {
   const system = currentSystem();
   return system.options.find((option) => option.value === skill)?.label ?? skill;
+}
+
+function compareBaseStandings(left, right) {
+  if (right.points !== left.points) return right.points - left.points;
+  if (right.diff !== left.diff) return right.diff - left.diff;
+  if (right.scored !== left.scored) return right.scored - left.scored;
+  return 0;
+}
+
+function pairKey(teamA, teamB) {
+  return [teamA, teamB].sort().join('__');
+}
+
+function createMatch(id, round, teamA, teamB) {
+  return {
+    id,
+    round,
+    teamA,
+    teamB,
+    scoreA: '',
+    scoreB: '',
+    winnerId: '',
+  };
+}
+
+function tiebreakWinnerMap(extraRounds) {
+  return new Map(
+    extraRounds
+      .filter((match) => match.winnerId)
+      .map((match) => [pairKey(match.teamA, match.teamB), match.winnerId]),
+  );
+}
+
+function compareStandings(left, right, winnerMap) {
+  const base = compareBaseStandings(left, right);
+  if (base !== 0) return base;
+
+  const winnerId = winnerMap.get(pairKey(left.team.id, right.team.id));
+  if (winnerId === left.team.id) return -1;
+  if (winnerId === right.team.id) return 1;
+  return 0;
+}
+
+function rankStandings(standings, extraRounds) {
+  const winnerMap = tiebreakWinnerMap(extraRounds);
+  return [...standings].sort((left, right) => compareStandings(left, right, winnerMap));
+}
+
+function standingsNeedTiebreak(standings, extraRounds) {
+  const ordered = [...standings].sort(compareBaseStandings);
+  const winnerMap = tiebreakWinnerMap(extraRounds);
+  const limit = Math.min(ordered.length - 1, 3);
+
+  for (let index = 0; index <= limit; index += 1) {
+    const left = ordered[index];
+    const right = ordered[index + 1];
+    if (!left || !right) continue;
+    if (compareBaseStandings(left, right) === 0 && !winnerMap.has(pairKey(left.team.id, right.team.id))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildTiebreakers(standings, existingExtraRounds) {
+  const ordered = [...standings].sort(compareBaseStandings);
+  const existingPairs = new Map(existingExtraRounds.map((match) => [pairKey(match.teamA, match.teamB), match]));
+  const required = [];
+  const limit = Math.min(ordered.length - 1, 3);
+
+  for (let index = 0; index <= limit; index += 1) {
+    const left = ordered[index];
+    const right = ordered[index + 1];
+    if (!left || !right) continue;
+    if (compareBaseStandings(left, right) !== 0) continue;
+
+    const key = pairKey(left.team.id, right.team.id);
+    const existing = existingPairs.get(key);
+    required.push(existing ?? createMatch(`tb-${left.team.id}-${right.team.id}`, 'Extra round', left.team.id, right.team.id));
+  }
+
+  return required;
+}
+
+function buildPlayoffMatches(standings, extraRounds) {
+  if (standings.length < 4) {
+    return { final: null, bronzeFinal: null };
+  }
+
+  if (standingsNeedTiebreak(standings, extraRounds)) {
+    return { final: null, bronzeFinal: null };
+  }
+
+  const ranked = rankStandings(standings, extraRounds);
+  return {
+    final: createMatch('final', 'Final', ranked[0].team.id, ranked[1].team.id),
+    bronzeFinal: createMatch('bronze-final', 'Bronze final', ranked[2].team.id, ranked[3].team.id),
+  };
 }
 
 function balanceTeams(players, teamCount) {
@@ -143,7 +243,7 @@ function roundRobinPairs(teams) {
 
 function standingsFromMatches(teams, matches) {
   const base = new Map(
-    teams.map((team) => [team.id, { team, played: 0, wins: 0, losses: 0, scored: 0, allowed: 0, diff: 0 }]),
+    teams.map((team) => [team.id, { team, played: 0, points: 0, wins: 0, losses: 0, scored: 0, allowed: 0, diff: 0 }]),
   );
 
   for (const match of matches) {
@@ -164,43 +264,22 @@ function standingsFromMatches(teams, matches) {
     teamB.diff = teamB.scored - teamB.allowed;
 
     if (match.winnerId === match.teamA) {
+      teamA.points += 1;
       teamA.wins += 1;
       teamB.losses += 1;
     } else if (match.winnerId === match.teamB) {
+      teamB.points += 1;
       teamB.wins += 1;
       teamA.losses += 1;
     }
   }
 
   return [...base.values()].sort((left, right) => {
-    if (right.wins !== left.wins) return right.wins - left.wins;
+    if (right.points !== left.points) return right.points - left.points;
     if (right.diff !== left.diff) return right.diff - left.diff;
     if (right.scored !== left.scored) return right.scored - left.scored;
     return left.team.name.localeCompare(right.team.name);
   });
-}
-
-function buildSemifinals(standings) {
-  if (standings.length < 4) return [];
-  const topFour = standings.slice(0, 4).map((entry) => entry.team.id);
-  return [
-    { id: 'sf-1', round: 'Semifinal', teamA: topFour[0], teamB: topFour[3], scoreA: '', scoreB: '', winnerId: '' },
-    { id: 'sf-2', round: 'Semifinal', teamA: topFour[1], teamB: topFour[2], scoreA: '', scoreB: '', winnerId: '' },
-  ];
-}
-
-function buildFinal(semifinals, teamsById) {
-  const winners = semifinals.filter((match) => match.winnerId).map((match) => match.winnerId);
-  if (winners.length < 2) return null;
-  return {
-    id: 'final',
-    round: 'Final',
-    teamA: winners[0],
-    teamB: winners[1],
-    scoreA: '',
-    scoreB: '',
-    winnerId: '',
-  };
 }
 
 function teamMap() {
@@ -237,14 +316,46 @@ function generateTournament() {
   state.teamCount = teamCount;
   state.teams = balanceTeams(players, teamCount);
   state.matches = roundRobinPairs(state.teams);
-  state.semifinals = [];
+  state.extraRounds = [];
   state.final = null;
+  state.bronzeFinal = null;
   saveState();
   render();
 }
 
+function syncPlayoffs() {
+  const standings = standingsFromMatches(state.teams, state.matches);
+
+  if (standings.length < 4) {
+    state.extraRounds = [];
+    state.final = null;
+    state.bronzeFinal = null;
+    return;
+  }
+
+  const tiebreakers = buildTiebreakers(standings, state.extraRounds);
+  state.extraRounds = tiebreakers;
+
+  const playoffs = buildPlayoffMatches(standings, state.extraRounds);
+  state.final = playoffs.final;
+  state.bronzeFinal = playoffs.bronzeFinal;
+}
+
 function updateMatch(stage, id, field, value) {
-  const list = stage === 'roundRobin' ? state.matches : stage === 'semis' ? state.semifinals : state.final ? [state.final] : [];
+  const list =
+    stage === 'roundRobin'
+      ? state.matches
+      : stage === 'tiebreakers'
+        ? state.extraRounds
+        : stage === 'final'
+          ? state.final
+            ? [state.final]
+            : []
+          : stage === 'bronzeFinal'
+            ? state.bronzeFinal
+              ? [state.bronzeFinal]
+              : []
+            : [];
   const match = list.find((item) => item.id === id);
   if (!match) return;
 
@@ -254,8 +365,8 @@ function updateMatch(stage, id, field, value) {
     match.scoreB = '';
   }
 
-  if (stage === 'semis') {
-    state.final = buildFinal(state.semifinals, teamMap());
+  if (stage === 'roundRobin' || stage === 'tiebreakers') {
+    syncPlayoffs();
   }
 
   saveState();
@@ -263,9 +374,7 @@ function updateMatch(stage, id, field, value) {
 }
 
 function ensurePlayoffs() {
-  const standings = standingsFromMatches(state.teams, state.matches);
-  state.semifinals = buildSemifinals(standings);
-  state.final = buildFinal(state.semifinals, teamMap());
+  syncPlayoffs();
   saveState();
   render();
 }
@@ -287,16 +396,6 @@ function samplePlayers() {
   ];
   saveState();
   render();
-}
-
-function teamSelect(match, field) {
-  return `
-    <select data-stage="${match.stage}" data-id="${match.id}" data-field="${field}" class="select">
-      <option value="">Select winner</option>
-      <option value="${match.teamA}" ${match.winnerId === match.teamA ? 'selected' : ''}>${getTeamName(match.teamA)}</option>
-      <option value="${match.teamB}" ${match.winnerId === match.teamB ? 'selected' : ''}>${getTeamName(match.teamB)}</option>
-    </select>
-  `;
 }
 
 function renderMatch(match, stage) {
@@ -337,9 +436,9 @@ function render() {
   const system = currentSystem();
   const standings = standingsFromMatches(state.teams, state.matches);
   const matchCompletion = state.matches.filter((match) => match.winnerId).length;
-  const semisReady = standings.length >= 4;
-  const semifinalCards = state.semifinals.length ? state.semifinals : semisReady ? buildSemifinals(standings) : [];
-  const finalCard = state.final ?? buildFinal(semifinalCards, teamMap());
+  const extraRoundCards = state.extraRounds;
+  const finalCard = state.final;
+  const bronzeCard = state.bronzeFinal;
 
   app.innerHTML = `
     <div class="shell">
@@ -347,7 +446,7 @@ function render() {
         <div>
           <p class="eyebrow">VolleyFlow Planner</p>
           <h1>Build fair teams, run every matchup, and crown the winners.</h1>
-          <p class="lead">Add players, choose your skill system, generate balanced teams, then track round robin results into semifinals and a final.</p>
+          <p class="lead">Add players, choose your skill system, generate balanced teams, then track round robin results into the final, bronze final, and extra-round tiebreakers.</p>
         </div>
         <div class="hero-stats">
           <div><strong>${state.players.length}</strong><span>Players</span></div>
@@ -419,7 +518,7 @@ function render() {
               <p class="section-label">Teams</p>
               <h2>Fair team balance</h2>
             </div>
-            <button id="playoffsBtn" class="ghost" ${state.teams.length ? '' : 'disabled'}>Build semifinals</button>
+              <button id="playoffsBtn" class="ghost" ${state.teams.length ? '' : 'disabled'}>Build final bracket</button>
           </div>
 
           <div class="team-grid">
@@ -468,7 +567,7 @@ function render() {
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>Team</th><th>W</th><th>L</th><th>PF</th><th>PA</th><th>Diff</th></tr>
+                <tr><th>Team</th><th>Pts</th><th>L</th><th>PF</th><th>PA</th><th>Diff</th></tr>
               </thead>
               <tbody>
                 ${standings
@@ -476,7 +575,7 @@ function render() {
                     (entry) => `
                       <tr>
                         <td>${entry.team.name}</td>
-                        <td>${entry.wins}</td>
+                        <td>${entry.points}</td>
                         <td>${entry.losses}</td>
                         <td>${entry.scored}</td>
                         <td>${entry.allowed}</td>
@@ -494,18 +593,21 @@ function render() {
           <div class="panel-head">
             <div>
               <p class="section-label">Playoffs</p>
-              <h2>Semifinal and final</h2>
+              <h2>Final, bronze final, and tiebreakers</h2>
             </div>
           </div>
 
           <div class="match-list">
-            ${semifinalCards
-              .map((match) => ({ ...match, stage: 'semis' }))
-              .map((match) => renderMatch(match, 'semis'))
-              .join('') || '<p class="empty">Run round robin results first, then build the top 4 bracket.</p>'}
+            ${extraRoundCards
+              .map((match) => ({ ...match, stage: 'tiebreakers' }))
+              .map((match) => renderMatch(match, 'tiebreakers'))
+              .join('') || '<p class="empty">If two teams have the same points, an extra round appears here.</p>'}
           </div>
           <div class="final-box">
-            ${finalCard ? renderMatch({ ...finalCard, stage: 'final' }, 'final') : '<p class="empty">The final appears after both semifinals have a winner.</p>'}
+            ${finalCard ? renderMatch({ ...finalCard, stage: 'final' }, 'final') : '<p class="empty">The top 2 go straight to the final after tiebreakers.</p>'}
+          </div>
+          <div class="final-box">
+            ${bronzeCard ? renderMatch({ ...bronzeCard, stage: 'bronzeFinal' }, 'bronzeFinal') : '<p class="empty">The next 2 teams play the bronze final for third place.</p>'}
           </div>
         </section>
       </main>
@@ -565,4 +667,6 @@ function bindEvents() {
   });
 }
 
+syncPlayoffs();
+saveState();
 render();
