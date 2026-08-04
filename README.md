@@ -2,6 +2,8 @@
 
 A small volleyball tournament setup app for balancing teams, generating a round robin schedule, and advancing to semifinals and a final.
 
+Tiny update for the repo.
+
 ## Run locally
 
 ```bash
